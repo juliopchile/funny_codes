@@ -1,3 +1,5 @@
 inputs/
 out/
 ffmpeg_test/bin/
+codes/__pycache__/
+__pycache__/
