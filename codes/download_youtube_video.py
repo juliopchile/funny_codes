@@ -22,6 +22,103 @@ import yt_dlp
 import platform
 import unicodedata
 
+
+# ---------------------------
+# Política de idioma de audio
+# ---------------------------
+
+# Si True: si el video ofrece pistas de audio con idioma identificable y no hay
+# una pista que coincida con el idioma original, se aborta (no descarga).
+STRICT_ORIGINAL_AUDIO = True
+
+# Palabras clave típicas para pistas alternativas (auto-dub / traducción / descriptivo)
+_AUDIO_ALT_KEYWORDS = (
+    "dub",
+    "dubbed",
+    "dubbing",
+    "translated",
+    "translation",
+    "voiceover",
+    "voice-over",
+    "descriptive",
+    "description",
+)
+
+
+def _norm_lang(lang: str | None) -> str | None:
+    """Normaliza tags de idioma tipo 'es-419'/'pt-BR' => 'es-419' en minúsculas."""
+    if not lang:
+        return None
+    s = str(lang).strip().lower().replace("_", "-")
+    return s or None
+
+
+def _lang_matches(lang: str | None, desired: str | None) -> bool:
+    """Match flexible: 'es' coincide con 'es-419'; 'es-419' requiere exacto."""
+    lang_n = _norm_lang(lang)
+    desired_n = _norm_lang(desired)
+    if not lang_n or not desired_n:
+        return False
+    if desired_n == lang_n:
+        return True
+    # si el deseado es genérico (2-3 letras), aceptar variantes regionales
+    if len(desired_n) <= 3 and lang_n.startswith(desired_n + "-"):
+        return True
+    return False
+
+
+def _extract_original_languages(info: dict) -> list[str]:
+    """Devuelve lista de idiomas candidatos del audio original del video."""
+    candidates: list[str] = []
+
+    # yt-dlp suele exponer alguno de estos dependiendo del extractor/sitio
+    for k in ("original_language", "language"):
+        v = _norm_lang(info.get(k))
+        if v:
+            candidates.append(v)
+
+    # Algunas extracciones exponen una lista de pistas de audio (no siempre)
+    tracks = info.get("audio_tracks")
+    if isinstance(tracks, list):
+        for t in tracks:
+            if not isinstance(t, dict):
+                continue
+            # Heurística: marcar como original si no es dubbed/descriptive
+            kind = (t.get("kind") or "").lower()
+            if kind in ("dubbed", "descriptive"):
+                continue
+            lang = _norm_lang(t.get("language") or t.get("lang"))
+            if lang:
+                candidates.append(lang)
+
+    # Dedup manteniendo orden
+    return list(dict.fromkeys(candidates))
+
+
+def _is_alternate_audio_track(f: dict) -> bool:
+    """Heurística para detectar pistas alternativas (doblaje/traducción/descriptivo)."""
+    chunks: list[str] = []
+    for k in ("format_note", "format", "acodec"):
+        v = f.get(k)
+        if v:
+            chunks.append(str(v))
+
+    # yt-dlp a veces expone un dict de pista
+    at = f.get("audio_track")
+    if isinstance(at, dict):
+        for k in ("display_name", "name", "id", "kind"):
+            v = at.get(k)
+            if v:
+                chunks.append(str(v))
+    # o campos planos
+    for k in ("audio_track_id", "audio_track_name"):
+        v = f.get(k)
+        if v:
+            chunks.append(str(v))
+
+    haystack = " ".join(chunks).lower()
+    return any(kw in haystack for kw in _AUDIO_ALT_KEYWORDS)
+
 # ---------------------------
 # Constantes mínimas
 # ---------------------------
@@ -311,7 +408,10 @@ def _pick_best_video_format(info: dict) -> tuple[dict | None, bool]:
 
 
 def _pick_best_audio_format(info: dict, v_ff: str | None = None, compat: dict | None = None) -> dict | None:
-    """Mejor audio-only evitando OPUS; orden por quality>abr>tbr>asr y prioriza códecs compatibles con v_ff."""
+    """Mejor audio-only evitando OPUS; orden por quality>abr>tbr>asr y prioriza códecs compatibles con v_ff.
+
+    Además, intenta evitar pistas alternativas (doblaje/traducción/descriptivo).
+    """
     formats = info.get("formats") or []
     audio_only = [f for f in formats if (f.get("vcodec") or "").lower() == "none" and (f.get("acodec") or "").lower() != "none"]
     if not audio_only:
@@ -323,6 +423,8 @@ def _pick_best_audio_format(info: dict, v_ff: str | None = None, compat: dict | 
 
     # Evitar OPUS siempre
     audio_only = [f for f in audio_only if "opus" not in (f.get("acodec") or "").lower()]
+    # Evitar pistas alternativas (auto-dub / traducción / descriptivo) si se pueden identificar
+    audio_only = [f for f in audio_only if not _is_alternate_audio_track(f)]
     if not audio_only:
         return None
 
@@ -361,9 +463,13 @@ def _sorted_combined_formats(info: dict) -> list[dict]:
 
 
 def _sorted_audio_only_formats(info: dict, v_ff: str | None = None, compat: dict | None = None) -> list[dict]:
-    """
-    Devuelve audios ordenados por calidad, evitando OPUS siempre.
-    Prioriza acodecs compatibles con v_ff si se provee compat['nested'].
+    """Devuelve audios ordenados por calidad.
+
+    - Evita OPUS siempre.
+    - Evita pistas alternativas (auto-dub/traducción/descriptivo) si se pueden identificar.
+    - Si el video expone idioma original y STRICT_ORIGINAL_AUDIO=True, filtra para
+      usar solo el idioma original; si no hay coincidencias, devuelve [].
+    - Prioriza acodecs compatibles con v_ff si se provee compat['nested'].
     """
     formats = info.get("formats") or []
     audio_only = [f for f in formats if (f.get("vcodec") or "").lower() == "none" and (f.get("acodec") or "").lower() != "none"]
@@ -376,6 +482,31 @@ def _sorted_audio_only_formats(info: dict, v_ff: str | None = None, compat: dict
     audio_only = [f for f in audio_only if "opus" not in (f.get("acodec") or "").lower()]
     if not audio_only:
         return []
+
+    # Evitar pistas alternativas (auto-dub / traducción / descriptivo)
+    audio_only = [f for f in audio_only if not _is_alternate_audio_track(f)]
+    if not audio_only:
+        return []
+
+    # Enforce idioma original si está disponible (y si la política es estricta)
+    original_langs = _extract_original_languages(info)
+    if STRICT_ORIGINAL_AUDIO and original_langs:
+        matched: list[dict] = []
+        unknown: list[dict] = []
+        for f in audio_only:
+            f_lang = _norm_lang(f.get("language") or f.get("lang"))
+            if not f_lang:
+                unknown.append(f)
+                continue
+            if any(_lang_matches(f_lang, ol) for ol in original_langs):
+                matched.append(f)
+
+        # Si hay al menos un audio con idioma identificado y ninguno matchea, fallar.
+        # Nota: si todos son desconocidos, permitimos continuar (no podemos validar).
+        if not matched and any(_norm_lang(f.get("language") or f.get("lang")) for f in audio_only):
+            return []
+        # Preferir los que matchean. Si no hay matcheo pero todo es unknown, usar unknown.
+        audio_only = matched or unknown
 
     if v_ff and compat and isinstance(compat.get("nested"), dict):
         allowed_acodecs = set((compat["nested"].get(v_ff) or {}).keys())
@@ -531,6 +662,10 @@ def plan_for_video(info: dict, compat: dict, container_policy: dict[str, str] | 
         audio_sorted = _sorted_audio_only_formats(info, v_ff=v_ff, compat=compat)
         a_top = audio_sorted[0] if audio_sorted else None
 
+        # Si la política de idioma es estricta y no hay audio válido, abortar el plan
+        if STRICT_ORIGINAL_AUDIO and not a_top:
+            return None
+
         # Familias de audio (para contenedores válidos), sin libopus
         a_families: list[str] = []
         for a in audio_sorted[:5]:  # top-N familias
@@ -597,6 +732,26 @@ def plan_for_video(info: dict, compat: dict, container_policy: dict[str, str] | 
     if combined_sorted:
         # Preferir combinados sin OPUS en el fallback
         combined_no_opus = [f for f in combined_sorted if "opus" not in (f.get("acodec") or "").lower()]
+        # Evitar pistas alternativas cuando se puedan identificar
+        combined_no_opus = [f for f in combined_no_opus if not _is_alternate_audio_track(f)]
+
+        # Enforce idioma original en combinados si está disponible
+        original_langs = _extract_original_languages(info)
+        if STRICT_ORIGINAL_AUDIO and original_langs:
+            def _combined_lang_ok(fmt: dict) -> bool:
+                f_lang = _norm_lang(fmt.get("language") or fmt.get("lang"))
+                if not f_lang:
+                    # Si no sabemos el idioma, no podemos validar; preferir otros si existen
+                    return False
+                return any(_lang_matches(f_lang, ol) for ol in original_langs)
+
+            combined_lang_matched = [f for f in combined_no_opus if _combined_lang_ok(f)]
+            # Si existen combinados con idioma identificable y ninguno matchea => abortar
+            if not combined_lang_matched and any(_norm_lang(f.get("language") or f.get("lang")) for f in combined_no_opus):
+                return None
+            # Preferir los que matchean; si ninguno tiene idioma, seguimos con combined_no_opus
+            combined_no_opus = combined_lang_matched or combined_no_opus
+
         c_top = (combined_no_opus or combined_sorted)[0]
         v_ff = _norm_vcodec(c_top.get("vcodec"))
         a_ff = _norm_acodec(c_top.get("acodec"))
@@ -663,9 +818,11 @@ def resolve_installation_config(
     for info in metadata_list:
         plan = plan_for_video(info, compat, container_policy)
         if not plan:
+            orig_langs = _extract_original_languages(info)
             plans.append({
                 "url": info.get("webpage_url") or info.get("url"),
-                "error": "no_video_format_found",
+                "error": "strict_original_audio_failed" if (STRICT_ORIGINAL_AUDIO and orig_langs) else "no_video_format_found",
+                "original_languages": orig_langs,
             })
             continue
 
@@ -690,6 +847,7 @@ def resolve_installation_config(
             "title": title,
             "vcodec": (plan.v_fmt or {}).get("vcodec"),
             "acodec": (plan.a_fmt or plan.v_fmt or {}).get("acodec"),
+            "original_languages": _extract_original_languages(info),
             "container": plan.desired_container_key,
             "ext": plan.desired_ext,
             "format_str": plan.fmt_str,
@@ -723,6 +881,11 @@ def main(playlist_url: str):
 
     # 3) Mostrar plan resumido
     for p in plans:
+        if p.get("error"):
+            langs = p.get("original_languages") or []
+            hint = f" (original_lang={','.join(langs)})" if langs else ""
+            print(f"- {p.get('url')}: ERROR={p.get('error')}{hint}")
+            continue
         cands = ", ".join(p.get("container_candidates") or [])
         print(f"- {p.get('title')}: {p.get('format_str')} -> .{p.get('ext')} (candidatos=[{cands}])")
 
@@ -776,8 +939,8 @@ def show_video_metada(url):
 
 if __name__ == "__main__":
     # Ejemplo: playlist; puedes reemplazar por URL de video o lista
-    #url = "https://www.youtube.com/playlist?list=PLaAjsJBsA0UR77l10qnatZhgK7pwrdRHp"
-    url = "https://youtu.be/2uXClcfciVI"
+    url = "https://www.youtube.com/playlist?list=PLaAjsJBsA0UR77l10qnatZhgK7pwrdRHp"
+    #url = "https://youtu.be/2uXClcfciVI"
     #show_video_metada(url)
 
     main(playlist_url=url)
