@@ -24,5 +24,6 @@ def imagenes_a_pdf(lista_imagenes, archivo_salida):
         print("No se encontraron imágenes para convertir.")
 
 # Ejemplo de uso
-imagenes = ["inputs/1.jpg", "inputs/2.jpg", "inputs/3.jpg"]
+imagenes = [f"inputs/{f}" for f in os.listdir("inputs") if f.endswith((".jpg", ".jpeg", ".png"))]
+imagenes.sort()
 imagenes_a_pdf(imagenes, "out/pdf/reembolso_médico.pdf")

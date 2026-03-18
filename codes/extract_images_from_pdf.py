@@ -44,7 +44,7 @@ def extract_images_from_page(pdf_path, page_number, output_dir):
 
 
 if __name__ == "__main__":
-    pdf_path = "inputs/FormularioTrabajoTitulo_JulioLopez_firmado.pdf"
+    pdf_path = "inputs/modelo_operacion.pdf"
     output_dir = "out/extracted_images"
     #page_number = 14
 

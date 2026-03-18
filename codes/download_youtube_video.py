@@ -939,7 +939,7 @@ def show_video_metada(url):
 
 if __name__ == "__main__":
     # Ejemplo: playlist; puedes reemplazar por URL de video o lista
-    url = "https://www.youtube.com/playlist?list=PLaAjsJBsA0UR77l10qnatZhgK7pwrdRHp"
+    url = "https://www.instagram.com/p/DPRvpveiR2j/"
     #url = "https://youtu.be/2uXClcfciVI"
     #show_video_metada(url)
 
