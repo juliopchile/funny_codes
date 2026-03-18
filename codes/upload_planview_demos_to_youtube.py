@@ -32,6 +32,7 @@ requested for Planview demos.
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -39,6 +40,7 @@ import logging
 from pathlib import Path
 import re
 import sys
+import time
 from typing import Any
 
 
@@ -52,6 +54,13 @@ TOKEN_FILE_DEFAULT = PROJECT_ROOT / "out" / "youtube_upload" / "token.json"
 
 RUN_LIMIT: int | None = None
 RUN_DRY_RUN = False
+RUN_PROGRESS_LOGS = True
+RUN_BATCH_SIZE: int | None = 3
+RUN_BATCH_SLEEP_SECONDS = 120
+RUN_RETRYABLE_LIMIT_ATTEMPTS = 3
+RUN_RETRYABLE_LIMIT_SLEEP_SECONDS = 15
+
+DEFAULT_YOUTUBE_VIDEO_CATEGORY_ID = "28"
 
 YOUTUBE_UPLOAD_COST = 100
 YOUTUBE_PLAYLIST_ITEM_INSERT_COST = 50
@@ -62,12 +71,144 @@ YOUTUBE_SCOPES = (
     "https://www.googleapis.com/auth/youtube.force-ssl",
 )
 
-TITLE_MAX_CHARS = 100
+TITLE_MAX_CHARS = 128
 DESCRIPTION_MAX_BYTES = 5000
 
 
 class QuotaBudgetExceeded(RuntimeError):
     """Raised when the configured daily quota budget would be exceeded."""
+
+
+def extract_youtube_error_reasons(exc: Exception) -> list[str]:
+    """Extract structured YouTube API error reasons when possible."""
+
+    response = getattr(exc, "resp", None)
+    status = getattr(response, "status", None)
+    if status not in {400, 403, 429}:
+        return []
+
+    content = getattr(exc, "content", None)
+    if isinstance(content, bytes):
+        try:
+            payload = json.loads(content.decode("utf-8", errors="replace"))
+        except Exception:
+            payload = {}
+    elif isinstance(content, str):
+        try:
+            payload = json.loads(content)
+        except Exception:
+            payload = {}
+    else:
+        payload = {}
+
+    reasons: list[str] = []
+    for error in payload.get("error", {}).get("errors", []) or []:
+        if isinstance(error, dict) and error.get("reason"):
+            reasons.append(str(error["reason"]).lower())
+    return reasons
+
+
+def describe_youtube_limit_error(exc: Exception) -> str:
+    """Build a clearer message for YouTube upload/limit errors."""
+
+    reasons = set(extract_youtube_error_reasons(exc))
+    if "uploadlimitexceeded" in reasons:
+        return (
+            "YouTube devolvio uploadLimitExceeded: el canal o usuario autenticado excedio "
+            "la cantidad de videos que puede subir en este momento. Esto no es la cuota "
+            "diaria del proyecto en Google Cloud."
+        )
+    if any(reason in {"quotaexceeded", "dailylimitexceeded"} for reason in reasons):
+        return "YouTube devolvio un error real de cuota diaria del proyecto."
+    if any(reason in {"ratelimitexceeded", "userratelimitexceeded"} for reason in reasons):
+        return "YouTube devolvio un error real de rate limit para este usuario o cliente."
+
+    message = str(exc).lower()
+    if "uploadlimitexceeded" in message:
+        return (
+            "YouTube devolvio uploadLimitExceeded: el canal o usuario autenticado excedio "
+            "la cantidad de videos que puede subir en este momento."
+        )
+    if "quota" in message:
+        return "YouTube devolvio un error real de cuota."
+    if "rate limit" in message or "too many requests" in message:
+        return "YouTube devolvio un error real de rate limit."
+    return "YouTube devolvio un error real de cuota o rate limit."
+
+
+def is_youtube_daily_quota_error(exc: Exception) -> bool:
+    """Return True for project-level daily quota errors."""
+
+    reasons = set(extract_youtube_error_reasons(exc))
+    if any(reason in {"quotaexceeded", "dailylimitexceeded"} for reason in reasons):
+        return True
+    message = str(exc).lower()
+    return "quotaexceeded" in message or "dailylimitexceeded" in message
+
+
+def is_youtube_retryable_limit_error(exc: Exception) -> bool:
+    """Return True for upload/rate-limit errors worth retrying."""
+
+    reasons = set(extract_youtube_error_reasons(exc))
+    if any(reason in {"uploadlimitexceeded", "ratelimitexceeded", "userratelimitexceeded"} for reason in reasons):
+        return True
+    message = str(exc).lower()
+    return any(token in message for token in ("uploadlimitexceeded", "rate limit", "too many requests"))
+
+
+def is_youtube_quota_error(exc: Exception) -> bool:
+    """Return True when an exception looks like a real YouTube quota/rate-limit error."""
+
+    message = str(exc).lower()
+    if any(token in message for token in ("quota", "rate limit", "too many requests", "uploadlimitexceeded")):
+        return True
+
+    known_reasons = {
+        "quotaexceeded",
+        "dailylimitexceeded",
+        "ratelimitexceeded",
+        "userratelimitexceeded",
+        "uploadlimitexceeded",
+    }
+    if any(reason in known_reasons for reason in extract_youtube_error_reasons(exc)):
+        return True
+
+    return False
+
+
+def execute_with_limit_retries(
+    action_label: str,
+    func: Any,
+    *,
+    card_id: str | None,
+    progress_logs: bool,
+) -> Any:
+    """Execute a callable with retries for non-daily upload/rate-limit errors."""
+
+    last_exc: Exception | None = None
+    for attempt in range(1, RUN_RETRYABLE_LIMIT_ATTEMPTS + 1):
+        try:
+            return func()
+        except Exception as exc:
+            last_exc = exc
+            if is_youtube_daily_quota_error(exc) or not is_youtube_retryable_limit_error(exc):
+                raise
+            if attempt >= RUN_RETRYABLE_LIMIT_ATTEMPTS:
+                break
+            sleep_seconds = RUN_RETRYABLE_LIMIT_SLEEP_SECONDS * attempt
+            LOGGER.warning(
+                "%s: %s en %s. Reintentando en %ss (%s/%s).",
+                card_id or "upload",
+                action_label,
+                describe_youtube_limit_error(exc),
+                sleep_seconds,
+                attempt,
+                RUN_RETRYABLE_LIMIT_ATTEMPTS,
+            )
+            time.sleep(sleep_seconds)
+
+    assert last_exc is not None
+    raise last_exc
 
 
 @dataclass(frozen=True)
@@ -78,6 +219,17 @@ class CategoryConfig:
     json_path: Path
     playlist_id_key: str
     playlist_title_key: str
+
+
+@dataclass(frozen=True)
+class CategoryUploadReport:
+    """Summary of one upload category run."""
+
+    category: str
+    selected_pending: int
+    uploaded_now: int
+    playlist_attached_now: int
+    errors: int
 
 
 CATEGORY_CONFIGS = (
@@ -257,6 +409,43 @@ def ensure_youtube_fields(entry: dict[str, Any]) -> None:
     entry.setdefault("youtube_title_used", None)
     entry.setdefault("youtube_description_used", None)
     entry.setdefault("youtube_privacy_status", None)
+    entry.setdefault("youtube_source_video_path_used", None)
+
+
+def clear_dry_run_youtube_fields(entry: dict[str, Any]) -> bool:
+    """Remove persisted dry-run markers from an entry."""
+
+    changed = False
+
+    if str(entry.get("youtube_video_id") or "").startswith("dry_run_"):
+        entry["youtube_video_id"] = None
+        changed = True
+    if str(entry.get("youtube_video_url") or "").startswith("https://www.youtube.com/watch?v=dry_run_"):
+        entry["youtube_video_url"] = None
+        changed = True
+    if str(entry.get("youtube_playlist_id") or "").startswith("dry_run_"):
+        entry["youtube_playlist_id"] = None
+        changed = True
+    if str(entry.get("youtube_playlist_item_id") or "").startswith("dry_run_"):
+        entry["youtube_playlist_item_id"] = None
+        changed = True
+    if entry.get("youtube_uploaded") and entry.get("youtube_video_id") is None:
+        entry["youtube_uploaded"] = False
+        changed = True
+    if entry.get("youtube_uploaded_at") and not entry.get("youtube_uploaded"):
+        entry["youtube_uploaded_at"] = None
+        changed = True
+    if entry.get("youtube_title_used") and not entry.get("youtube_uploaded"):
+        entry["youtube_title_used"] = None
+        changed = True
+    if entry.get("youtube_description_used") and not entry.get("youtube_uploaded"):
+        entry["youtube_description_used"] = None
+        changed = True
+    if entry.get("youtube_privacy_status") and not entry.get("youtube_uploaded"):
+        entry["youtube_privacy_status"] = None
+        changed = True
+
+    return changed
 
 
 def set_upload_error(entry: dict[str, Any], error: Exception | str, *, stage: str) -> None:
@@ -283,11 +472,35 @@ def clear_upload_error(entry: dict[str, Any]) -> None:
     entry["youtube_upload_error"] = None
 
 
+def get_upload_video_path(entry: dict[str, Any]) -> Path | None:
+    """Return the preferred local file path to upload."""
+
+    for key in ("normalized_video_path", "video_path"):
+        value = entry.get(key)
+        if value:
+            path = Path(str(value)).expanduser()
+            if path.exists():
+                return path
+    return None
+
+
 def is_ready_for_upload(entry: dict[str, Any]) -> bool:
     """Return True when a JSON entry has a local video file ready."""
 
-    video_path = entry.get("video_path")
-    return bool(video_path and Path(video_path).exists())
+    return get_upload_video_path(entry) is not None
+
+
+def entry_card_numeric_id(entry: dict[str, Any]) -> int:
+    """Extract the numeric suffix from card_id."""
+
+    match = re.search(r"(\d+)$", str(entry.get("card_id") or ""))
+    return int(match.group(1)) if match else 10**12
+
+
+def upload_sort_key(entry: dict[str, Any]) -> int:
+    """Sort uploads by the scraped card id, older cards first."""
+
+    return entry_card_numeric_id(entry)
 
 
 def normalize_spaces(value: str | None) -> str:
@@ -304,7 +517,7 @@ def sanitize_youtube_title(entry: dict[str, Any]) -> str:
     base_title = (
         entry.get("demo_title")
         or entry.get("card_title")
-        or Path(str(entry.get("video_path") or "video")).stem
+        or Path(str(get_upload_video_path(entry) or "video")).stem
     )
     title = normalize_spaces(str(base_title))
     title = title.replace("<", "-").replace(">", "-")
@@ -372,6 +585,11 @@ def load_client_config(env: dict[str, str]) -> tuple[dict[str, Any] | None, Path
     if not client_id or not client_secret:
         raise ValueError(
             "Debes definir YOUTUBE_CLIENT_SECRETS_FILE o bien YOUTUBE_CLIENT_ID y YOUTUBE_CLIENT_SECRET en .env."
+        )
+    if "your_google_oauth_client_id" in client_id or "your_google_oauth_client_secret" in client_secret:
+        raise ValueError(
+            "Tu .env aun tiene valores de ejemplo para YouTube OAuth. "
+            "Reemplazalos por credenciales reales o usa YOUTUBE_CLIENT_SECRETS_FILE."
         )
 
     client_config = {
@@ -468,13 +686,15 @@ def create_playlist(
     *,
     dry_run: bool,
     quota_state: dict[str, int | None],
+    progress_logs: bool,
 ) -> str:
     """Create a playlist for one category."""
 
     consume_quota(quota_state, YOUTUBE_PLAYLIST_CREATE_COST, f"crear playlist '{title}'")
     if dry_run:
         fake_id = f"dry_run_{re.sub(r'[^a-z0-9]+', '_', title.lower()).strip('_') or 'playlist'}"
-        LOGGER.info("DRY RUN: se crearia playlist '%s' con id %s", title, fake_id)
+        if progress_logs:
+            LOGGER.info("DRY RUN: se crearia playlist '%s' con id %s", title, fake_id)
         return fake_id
 
     response = (
@@ -492,12 +712,13 @@ def create_playlist(
 
 
 def resolve_playlist_id(
-    youtube: Any,
+    youtube: Any | None,
     env: dict[str, str],
     config: CategoryConfig,
     *,
     dry_run: bool,
     quota_state: dict[str, int | None],
+    progress_logs: bool,
 ) -> str:
     """Resolve or create the playlist for one category."""
 
@@ -508,6 +729,16 @@ def resolve_playlist_id(
     playlist_title = env_get(env, config.playlist_title_key)
     if not playlist_title:
         raise ValueError(f"Falta {config.playlist_title_key} en .env.")
+
+    if dry_run:
+        return create_playlist(
+            youtube,
+            playlist_title,
+            validate_playlist_privacy_status(env_get(env, "YOUTUBE_PLAYLIST_PRIVACY_STATUS")),
+            dry_run=True,
+            quota_state=quota_state,
+            progress_logs=progress_logs,
+        )
 
     existing_id = find_playlist_by_title(youtube, playlist_title)
     if existing_id:
@@ -526,6 +757,7 @@ def resolve_playlist_id(
         playlist_privacy,
         dry_run=dry_run,
         quota_state=quota_state,
+        progress_logs=progress_logs,
     )
     LOGGER.info("%s: playlist creada '%s' (%s).", config.name, playlist_title, playlist_id)
     return playlist_id
@@ -539,27 +771,34 @@ def upload_video_file(
     *,
     dry_run: bool,
     quota_state: dict[str, int | None],
+    progress_logs: bool,
 ) -> tuple[str, str, str]:
     """Upload a local video file to YouTube."""
 
     consume_quota(quota_state, YOUTUBE_UPLOAD_COST, f"subir video {entry.get('card_id')}")
+    upload_path = get_upload_video_path(entry)
+    if upload_path is None:
+        raise ValueError("La entrada no tiene un video local listo para subir.")
 
     title = sanitize_youtube_title(entry)
     description = sanitize_youtube_description(entry)
     privacy_status = validate_privacy_status(env_get(env, "YOUTUBE_VIDEO_PRIVACY_STATUS"))
-    category_id = env_get(env, "YOUTUBE_VIDEO_CATEGORY_ID", "22") or "22"
+    category_id = env_get(env, "YOUTUBE_VIDEO_CATEGORY_ID", DEFAULT_YOUTUBE_VIDEO_CATEGORY_ID) or DEFAULT_YOUTUBE_VIDEO_CATEGORY_ID
     made_for_kids = env_get_bool(env, "YOUTUBE_MADE_FOR_KIDS", default=False)
     notify_subscribers = env_get_bool(env, "YOUTUBE_NOTIFY_SUBSCRIBERS", default=False)
+    contains_synthetic_media = env_get_bool(env, "YOUTUBE_CONTAINS_SYNTHETIC_MEDIA", default=False)
+    has_paid_product_placement = env_get_bool(env, "YOUTUBE_HAS_PAID_PRODUCT_PLACEMENT", default=False)
 
     if dry_run:
         fake_video_id = f"dry_run_video_{entry.get('resource_id')}"
-        LOGGER.info("DRY RUN: se subiria %s como '%s'.", entry.get("video_path"), title)
+        if progress_logs:
+            LOGGER.info("DRY RUN: se subiria %s como '%s'.", upload_path, title)
         return fake_video_id, title, description
 
     MediaFileUpload = google["MediaFileUpload"]
 
     request = youtube.videos().insert(
-        part="snippet,status",
+        part="snippet,status,paidProductPlacementDetails",
         notifySubscribers=notify_subscribers,
         body={
             "snippet": {
@@ -569,16 +808,30 @@ def upload_video_file(
             },
             "status": {
                 "privacyStatus": privacy_status,
+                "embeddable": True,
+                "publicStatsViewable": True,
                 "selfDeclaredMadeForKids": made_for_kids,
+                "containsSyntheticMedia": contains_synthetic_media,
+            },
+            "paidProductPlacementDetails": {
+                "hasPaidProductPlacement": has_paid_product_placement,
             },
         },
-        media_body=MediaFileUpload(str(Path(entry["video_path"])), chunksize=8 * 1024 * 1024, resumable=True),
+        media_body=MediaFileUpload(str(upload_path), chunksize=8 * 1024 * 1024, resumable=True),
     )
 
-    response = None
-    while response is None:
-        _, response = request.next_chunk()
+    def _perform_upload() -> dict[str, Any]:
+        response = None
+        while response is None:
+            _, response = request.next_chunk()
+        return response
 
+    response = execute_with_limit_retries(
+        "subida de video",
+        _perform_upload,
+        card_id=str(entry.get("card_id") or ""),
+        progress_logs=progress_logs,
+    )
     return response["id"], title, description
 
 
@@ -589,30 +842,37 @@ def add_video_to_playlist(
     *,
     dry_run: bool,
     quota_state: dict[str, int | None],
+    progress_logs: bool,
 ) -> str:
     """Add an uploaded video to a playlist."""
 
     consume_quota(quota_state, YOUTUBE_PLAYLIST_ITEM_INSERT_COST, f"agregar {video_id} a playlist")
     if dry_run:
         fake_item_id = f"dry_run_playlist_item_{video_id}"
-        LOGGER.info("DRY RUN: se agregaria %s a playlist %s.", video_id, playlist_id)
+        if progress_logs:
+            LOGGER.info("DRY RUN: se agregaria %s a playlist %s.", video_id, playlist_id)
         return fake_item_id
 
-    response = (
-        youtube.playlistItems()
-        .insert(
-            part="snippet",
-            body={
-                "snippet": {
-                    "playlistId": playlist_id,
-                    "resourceId": {
-                        "kind": "youtube#video",
-                        "videoId": video_id,
-                    },
-                }
-            },
-        )
-        .execute()
+    response = execute_with_limit_retries(
+        "agregado a playlist",
+        lambda: (
+            youtube.playlistItems()
+            .insert(
+                part="snippet",
+                body={
+                    "snippet": {
+                        "playlistId": playlist_id,
+                        "resourceId": {
+                            "kind": "youtube#video",
+                            "videoId": video_id,
+                        },
+                    }
+                },
+            )
+            .execute()
+        ),
+        card_id=video_id,
+        progress_logs=progress_logs,
     )
     return response["id"]
 
@@ -626,6 +886,7 @@ def process_entry_upload(
     *,
     dry_run: bool,
     quota_state: dict[str, int | None],
+    progress_logs: bool,
 ) -> None:
     """Upload one entry and attach it to the target playlist."""
 
@@ -643,6 +904,7 @@ def process_entry_upload(
             env,
             dry_run=dry_run,
             quota_state=quota_state,
+            progress_logs=progress_logs,
         )
         entry["youtube_uploaded"] = True
         entry["youtube_video_id"] = video_id
@@ -651,6 +913,7 @@ def process_entry_upload(
         entry["youtube_title_used"] = title_used
         entry["youtube_description_used"] = description_used
         entry["youtube_privacy_status"] = validate_privacy_status(env_get(env, "YOUTUBE_VIDEO_PRIVACY_STATUS"))
+        entry["youtube_source_video_path_used"] = str(get_upload_video_path(entry))
         clear_upload_error(entry)
 
     if entry.get("youtube_uploaded") and not entry.get("youtube_playlist_item_id"):
@@ -661,6 +924,7 @@ def process_entry_upload(
             video_id,
             dry_run=dry_run,
             quota_state=quota_state,
+            progress_logs=progress_logs,
         )
         entry["youtube_playlist_id"] = playlist_id
         entry["youtube_playlist_item_id"] = playlist_item_id
@@ -668,21 +932,29 @@ def process_entry_upload(
 
 
 def upload_category(
-    youtube: Any,
+    youtube: Any | None,
     google: dict[str, Any],
     env: dict[str, str],
     config: CategoryConfig,
     *,
     limit: int | None,
+    batch_size: int | None,
+    batch_sleep_seconds: int,
     dry_run: bool,
     quota_state: dict[str, int | None],
-) -> None:
+    progress_logs: bool,
+) -> CategoryUploadReport:
     """Upload all pending entries for one category."""
 
     store = load_store(config)
+    cleaned_dry_run_data = False
     for entry in store.get("items", []):
         ensure_youtube_fields(entry)
-    save_store(config, store)
+        cleaned_dry_run_data = clear_dry_run_youtube_fields(entry) or cleaned_dry_run_data
+    if cleaned_dry_run_data:
+        LOGGER.info("%s: se limpiaron marcas previas de dry-run en el JSON.", config.name)
+    if not dry_run or cleaned_dry_run_data:
+        save_store(config, store)
 
     playlist_id = resolve_playlist_id(
         youtube,
@@ -690,46 +962,147 @@ def upload_category(
         config,
         dry_run=dry_run,
         quota_state=quota_state,
+        progress_logs=progress_logs,
     )
-
-    items = sort_items(store.get("items", []))
-    if limit is not None:
-        items = items[:limit]
 
     initial_summary = summarize_store(store)
     LOGGER.info("%s: estado inicial %s", config.name, initial_summary)
 
-    processed = 0
-    for entry in items:
-        if not is_ready_for_upload(entry):
-            continue
-        if entry.get("youtube_uploaded") and entry.get("youtube_playlist_item_id"):
-            continue
+    pending_items = [
+        entry
+        for entry in sorted(sort_items(store.get("items", [])), key=upload_sort_key)
+        if is_ready_for_upload(entry)
+        and not (entry.get("youtube_uploaded") and entry.get("youtube_playlist_item_id"))
+    ]
+    if limit is not None:
+        pending_items = pending_items[:limit]
 
+    processed = 0
+    uploaded_now = 0
+    playlist_attached_now = 0
+    errors = 0
+    total_pending = len(pending_items)
+    processed_in_batch = 0
+
+    for index, entry in enumerate(pending_items, start=1):
         processed += 1
+        processed_in_batch += 1
+        target_entry = copy.deepcopy(entry) if dry_run else entry
+        was_uploaded = bool(entry.get("youtube_uploaded"))
+        had_playlist_item = bool(entry.get("youtube_playlist_item_id"))
+        if progress_logs:
+            action = "subiendo" if not was_uploaded else "agregando a playlist"
+            LOGGER.info(
+                "%s: [%s/%s] %s %s | %s",
+                config.name,
+                index,
+                total_pending,
+                action,
+                entry.get("card_id"),
+                normalize_spaces(entry.get("demo_title") or entry.get("card_title")) or Path(str(get_upload_video_path(entry))).name,
+            )
         try:
             process_entry_upload(
                 youtube,
                 google,
                 env,
-                entry,
+                target_entry,
                 playlist_id,
                 dry_run=dry_run,
                 quota_state=quota_state,
+                progress_logs=progress_logs,
             )
+            if bool(target_entry.get("youtube_uploaded")) and not was_uploaded:
+                uploaded_now += 1
+            if bool(target_entry.get("youtube_playlist_item_id")) and not had_playlist_item:
+                playlist_attached_now += 1
+            if progress_logs:
+                done_parts = []
+                if bool(target_entry.get("youtube_uploaded")) and not was_uploaded:
+                    done_parts.append("video subido")
+                if bool(target_entry.get("youtube_playlist_item_id")) and not had_playlist_item:
+                    done_parts.append("agregado a playlist")
+                if not done_parts:
+                    done_parts.append("sin cambios")
+                LOGGER.info(
+                    "%s: [%s/%s] listo %s | %s",
+                    config.name,
+                    index,
+                    total_pending,
+                    entry.get("card_id"),
+                    ", ".join(done_parts),
+                )
         except QuotaBudgetExceeded:
-            save_store(config, store)
+            if not dry_run:
+                save_store(config, store)
             raise
         except Exception as exc:
-            set_upload_error(entry, exc, stage="youtube_upload")
+            errors += 1
+            if not dry_run and is_youtube_daily_quota_error(exc):
+                set_upload_error(entry, exc, stage="youtube_upload")
+                save_store(config, store)
+                raise QuotaBudgetExceeded(describe_youtube_limit_error(exc)) from exc
+
+            if not dry_run and is_youtube_retryable_limit_error(exc):
+                set_upload_error(entry, exc, stage="youtube_upload")
+                if progress_logs:
+                    LOGGER.warning(
+                        "%s: [%s/%s] se omite %s tras agotar reintentos | %s",
+                        config.name,
+                        index,
+                        total_pending,
+                        entry.get("card_id"),
+                        describe_youtube_limit_error(exc),
+                    )
+                continue
+
+            if dry_run:
+                LOGGER.warning("%s: DRY RUN detecto un error simulado para %s: %s", config.name, entry.get("card_id"), exc)
+            else:
+                set_upload_error(entry, exc, stage="youtube_upload")
+            if progress_logs:
+                LOGGER.warning(
+                    "%s: [%s/%s] fallo %s | %s",
+                    config.name,
+                    index,
+                    total_pending,
+                    entry.get("card_id"),
+                    exc,
+                )
         finally:
-            save_store(config, store)
+            if not dry_run:
+                save_store(config, store)
+
+        if (
+            not dry_run
+            and batch_size is not None
+            and batch_size > 0
+            and batch_sleep_seconds > 0
+            and processed_in_batch >= batch_size
+            and index < total_pending
+        ):
+            LOGGER.info(
+                "%s: lote de %s elementos completado; esperando %ss antes de continuar (%s restantes).",
+                config.name,
+                processed_in_batch,
+                batch_sleep_seconds,
+                total_pending - index,
+            )
+            time.sleep(batch_sleep_seconds)
+            processed_in_batch = 0
 
     if processed == 0:
         LOGGER.info("%s: no hay videos pendientes por subir o enlazar a playlist.", config.name)
 
     final_summary = summarize_store(store)
     LOGGER.info("%s: estado final %s", config.name, final_summary)
+    return CategoryUploadReport(
+        category=config.name,
+        selected_pending=total_pending,
+        uploaded_now=uploaded_now,
+        playlist_attached_now=playlist_attached_now,
+        errors=errors,
+    )
 
 
 def validate_run_configuration() -> None:
@@ -737,6 +1110,10 @@ def validate_run_configuration() -> None:
 
     if RUN_LIMIT is not None and RUN_LIMIT <= 0:
         raise ValueError("RUN_LIMIT debe ser None o un entero positivo.")
+    if RUN_BATCH_SIZE is not None and RUN_BATCH_SIZE <= 0:
+        raise ValueError("RUN_BATCH_SIZE debe ser None o un entero positivo.")
+    if RUN_BATCH_SLEEP_SECONDS < 0:
+        raise ValueError("RUN_BATCH_SLEEP_SECONDS no puede ser negativo.")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -750,13 +1127,43 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Sube solo los primeros N videos pendientes por categoria.",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Procesa los pendientes en lotes de N por categoria antes de pausar.",
+    )
+    parser.add_argument(
+        "--batch-sleep-seconds",
+        type=int,
+        default=None,
+        help="Segundos de pausa entre lotes por categoria.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="No sube nada; solo simula acciones y consume cuota estimada localmente.",
     )
+    parser.add_argument(
+        "--progress-logs",
+        dest="progress_logs",
+        action="store_true",
+        default=None,
+        help="Muestra progreso detallado por video.",
+    )
+    parser.add_argument(
+        "--no-progress-logs",
+        dest="progress_logs",
+        action="store_false",
+        default=None,
+        help="Oculta el progreso detallado por video.",
+    )
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit debe ser un entero positivo.")
+    if args.batch_size is not None and args.batch_size <= 0:
+        parser.error("--batch-size debe ser un entero positivo.")
+    if args.batch_sleep_seconds is not None and args.batch_sleep_seconds < 0:
+        parser.error("--batch-sleep-seconds no puede ser negativo.")
     return args
 
 
@@ -773,38 +1180,86 @@ def main(argv: list[str] | None = None) -> int:
         validate_run_configuration()
         limit = RUN_LIMIT
         dry_run = RUN_DRY_RUN
+        progress_logs = RUN_PROGRESS_LOGS
+        batch_size = RUN_BATCH_SIZE
+        batch_sleep_seconds = RUN_BATCH_SLEEP_SECONDS
     else:
         args = parse_args(effective_argv)
         limit = args.limit
         dry_run = args.dry_run
+        progress_logs = RUN_PROGRESS_LOGS if args.progress_logs is None else args.progress_logs
+        batch_size = RUN_BATCH_SIZE if args.batch_size is None else args.batch_size
+        batch_sleep_seconds = (
+            RUN_BATCH_SLEEP_SECONDS if args.batch_sleep_seconds is None else args.batch_sleep_seconds
+        )
 
-    LOGGER.info("Ejecutando upload a YouTube limit=%s dry_run=%s env=%s", limit, dry_run, ENV_PATH)
+    LOGGER.info(
+        "Ejecutando upload a YouTube limit=%s batch_size=%s batch_sleep_seconds=%s dry_run=%s progress_logs=%s env=%s",
+        limit,
+        batch_size,
+        batch_sleep_seconds,
+        dry_run,
+        progress_logs,
+        ENV_PATH,
+    )
 
     env = load_env_file(ENV_PATH)
-    google = import_google_components()
-    youtube = get_authenticated_service(env, google)
+    if dry_run:
+        google: dict[str, Any] = {}
+        youtube = None
+    else:
+        google = import_google_components()
+        youtube = get_authenticated_service(env, google)
 
     quota_budget = env_get_int(env, "YOUTUBE_DAILY_QUOTA_BUDGET", default=10_000)
     if quota_budget is not None and quota_budget <= 0:
         quota_budget = None
     quota_state: dict[str, int | None] = {"used": 0, "budget": quota_budget}
+    reports: list[CategoryUploadReport] = []
 
     try:
         for config in CATEGORY_CONFIGS:
-            upload_category(
-                youtube,
-                google,
-                env,
-                config,
-                limit=limit,
-                dry_run=dry_run,
-                quota_state=quota_state,
+            reports.append(
+                upload_category(
+                    youtube,
+                    google,
+                    env,
+                    config,
+                    limit=limit,
+                    batch_size=batch_size,
+                    batch_sleep_seconds=batch_sleep_seconds,
+                    dry_run=dry_run,
+                    quota_state=quota_state,
+                    progress_logs=progress_logs,
+                )
             )
     except QuotaBudgetExceeded as exc:
         LOGGER.warning("%s", exc)
         LOGGER.warning("Cuota estimada usada en esta corrida: %s", quota_state.get("used"))
         return 2
 
+    if reports:
+        overall_selected = sum(report.selected_pending for report in reports)
+        overall_uploaded = sum(report.uploaded_now for report in reports)
+        overall_playlist = sum(report.playlist_attached_now for report in reports)
+        overall_errors = sum(report.errors for report in reports)
+        for report in reports:
+            LOGGER.info(
+                "Resumen %s: seleccionados=%s, subidos_ahora=%s, agregados_playlist=%s, errores=%s",
+                report.category,
+                report.selected_pending,
+                report.uploaded_now,
+                report.playlist_attached_now,
+                report.errors,
+            )
+        LOGGER.info(
+            "Resumen final: seleccionados=%s, subidos_ahora=%s, agregados_playlist=%s, errores=%s, cuota_estimada=%s",
+            overall_selected,
+            overall_uploaded,
+            overall_playlist,
+            overall_errors,
+            quota_state.get("used"),
+        )
     LOGGER.info("Proceso terminado. Cuota estimada usada en esta corrida: %s", quota_state.get("used"))
     return 0
 

@@ -4,3 +4,4 @@ ffmpeg_test/bin/
 codes/__pycache__/
 __pycache__/
 .env
+/*.json

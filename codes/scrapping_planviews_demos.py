@@ -57,6 +57,7 @@ from pathlib import Path
 import re
 import sys
 from typing import Any
+from urllib.request import Request as UrlRequest, urlopen
 from urllib.parse import SplitResult, urlencode, urlsplit, urlunsplit
 
 
@@ -1105,6 +1106,144 @@ def resolve_downloaded_path(
     raise FileNotFoundError(f"No fue posible determinar el archivo descargado en {output_dir}")
 
 
+def extract_vidyard_uuid(vidyard_url: str) -> str:
+    """Extrae el UUID de player desde una URL de Vidyard."""
+
+    parsed = parse_url(vidyard_url)
+    match = re.search(r"/(?:player/)?([A-Za-z0-9_-]{8,})(?:\.(?:json|html))?(?:/.*)?$", parsed.path)
+    if not match:
+        raise ValueError(f"No fue posible extraer el UUID de Vidyard desde: {vidyard_url}")
+    return match.group(1)
+
+
+def build_vidyard_download_key(vidyard_url: str) -> str:
+    """Construye una clave estable para deduplicar descargas de Vidyard."""
+
+    try:
+        return extract_vidyard_uuid(vidyard_url)
+    except Exception:
+        return normalize_url(vidyard_url)
+
+
+def fetch_vidyard_player_payload(vidyard_url: str) -> dict[str, Any]:
+    """Descarga el JSON del player de Vidyard para usarlo como fallback."""
+
+    player_uuid = extract_vidyard_uuid(vidyard_url)
+    player_json_url = f"https://play.vidyard.com/player/{player_uuid}.json"
+    request = UrlRequest(
+        player_json_url,
+        headers={
+            "accept": "application/json",
+            "referer": "https://play.vidyard.com/",
+            "user-agent": "Mozilla/5.0",
+        },
+    )
+    with urlopen(request, timeout=45) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("payload"), dict):
+        raise ValueError(f"JSON inesperado recibido desde {player_json_url}")
+    return payload["payload"]
+
+
+def source_profile_rank(profile: str | None) -> int:
+    """Asigna una prioridad simple a perfiles de calidad."""
+
+    normalized = normalize_inline_text(profile).lower()
+    if normalized == "auto":
+        return 9_999
+    match = re.search(r"(\d+)", normalized)
+    if match:
+        return int(match.group(1))
+    return -1
+
+
+def choose_vidyard_fallback_source(payload: dict[str, Any]) -> tuple[str, str]:
+    """Elige una fuente descargable desde el JSON del player."""
+
+    chapters = payload.get("chapters") or []
+    if not isinstance(chapters, list) or not chapters:
+        raise ValueError("El player JSON de Vidyard no trae chapters.")
+
+    chapter = next((item for item in chapters if isinstance(item, dict) and item.get("sources")), None)
+    if chapter is None:
+        raise ValueError("No se encontró un chapter con sources en el player JSON de Vidyard.")
+
+    sources = chapter.get("sources") or {}
+    mp4_sources = [item for item in sources.get("mp4") or [] if isinstance(item, dict) and item.get("url")]
+    if mp4_sources:
+        best_mp4 = max(mp4_sources, key=lambda item: source_profile_rank(item.get("profile")))
+        return str(best_mp4["url"]), normalize_inline_text(chapter.get("name")) or "vidyard_video"
+
+    hls_sources = [item for item in sources.get("hls") or [] if isinstance(item, dict) and item.get("url")]
+    if hls_sources:
+        best_hls = max(hls_sources, key=lambda item: source_profile_rank(item.get("profile")))
+        return str(best_hls["url"]), normalize_inline_text(chapter.get("name")) or "vidyard_video"
+
+    raise ValueError("No se encontró una fuente mp4 ni hls utilizable en el player JSON de Vidyard.")
+
+
+def should_prefer_vidyard_fallback(payload: dict[str, Any]) -> bool:
+    """Indica si el player parece uno de los casos que rompen el extractor de yt_dlp."""
+
+    chapters = payload.get("chapters") or []
+    if len(chapters) != 1:
+        return False
+    chapter = chapters[0]
+    if not isinstance(chapter, dict):
+        return False
+    return not chapter.get("facadeUuid")
+
+
+def sanitize_download_basename(value: str) -> str:
+    """Limpia un nombre base para usarlo como archivo local."""
+
+    value = normalize_inline_text(value)
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1F]+', " ", value)
+    value = re.sub(r"\s+", " ", value).strip().strip(".")
+    return value or "vidyard_video"
+
+
+def download_single_video_via_vidyard_fallback(
+    yt_dlp: Any,
+    entry: dict[str, Any],
+    output_dir: Path,
+    *,
+    original_error: Exception,
+    payload: dict[str, Any] | None = None,
+) -> Path:
+    """Fallback de descarga cuando falla el extractor nativo de Vidyard."""
+
+    del original_error
+
+    vidyard_url = entry.get("vidyard_url")
+    assert vidyard_url
+
+    payload = payload or fetch_vidyard_player_payload(vidyard_url)
+    source_url, source_name = choose_vidyard_fallback_source(payload)
+    files_before = {path.resolve() for path in output_dir.glob("*") if path.is_file()}
+
+    fallback_name = sanitize_download_basename(source_name)
+    ydl_opts = {
+        "outtmpl": str(output_dir / f"{fallback_name}.%(ext)s"),
+        "noplaylist": True,
+        "quiet": False,
+        "no_warnings": False,
+        "http_headers": {
+            "Referer": "https://play.vidyard.com/",
+            "User-Agent": "Mozilla/5.0",
+        },
+    }
+
+    LOGGER.info(
+        "Usando fallback de player JSON para %s con fuente directa de Vidyard.",
+        entry.get("card_id") or vidyard_url,
+    )
+    with yt_dlp.YoutubeDL(ydl_opts) as downloader:
+        info = downloader.extract_info(source_url, download=True)
+    return resolve_downloaded_path(info, output_dir, files_before)
+
+
 def download_single_video(
     yt_dlp: Any,
     entry: dict[str, Any],
@@ -1125,9 +1264,43 @@ def download_single_video(
         "no_warnings": False,
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as downloader:
-        info = downloader.extract_info(vidyard_url, download=True)
-    return resolve_downloaded_path(info, output_dir, files_before)
+    fallback_payload: dict[str, Any] | None = None
+    try:
+        fallback_payload = fetch_vidyard_player_payload(vidyard_url)
+    except Exception:
+        fallback_payload = None
+
+    if fallback_payload and should_prefer_vidyard_fallback(fallback_payload):
+        LOGGER.info(
+            "Detectado player Vidyard legacy sin facadeUuid para %s; usando fallback directo.",
+            entry.get("card_id") or vidyard_url,
+        )
+        return download_single_video_via_vidyard_fallback(
+            yt_dlp,
+            entry,
+            output_dir,
+            original_error=RuntimeError("Vidyard legacy player"),
+            payload=fallback_payload,
+        )
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as downloader:
+            info = downloader.extract_info(vidyard_url, download=True)
+        return resolve_downloaded_path(info, output_dir, files_before)
+    except Exception as exc:
+        error_text = normalize_inline_text(str(exc))
+        if (
+            "Missing \"id\" field in extractor result" in error_text
+            or "Unable to download JSON metadata" in error_text
+        ):
+            return download_single_video_via_vidyard_fallback(
+                yt_dlp,
+                entry,
+                output_dir,
+                original_error=exc,
+                payload=fallback_payload,
+            )
+        raise
 
 
 def download_category_videos(config: CategoryConfig, *, limit_per_category: int | None) -> None:
@@ -1145,7 +1318,7 @@ def download_category_videos(config: CategoryConfig, *, limit_per_category: int 
     known_downloads: dict[str, str] = {}
     for item in store["items"]:
         if entry_has_download(item) and item.get("vidyard_url"):
-            known_downloads[item["vidyard_url"]] = item["video_path"]
+            known_downloads[build_vidyard_download_key(item["vidyard_url"])] = item["video_path"]
 
     items = prune_limit(sort_items(store["items"]), limit_per_category)
     processed_any = False
@@ -1153,6 +1326,7 @@ def download_category_videos(config: CategoryConfig, *, limit_per_category: int 
         vidyard_url = item.get("vidyard_url")
         if not vidyard_url:
             continue
+        vidyard_key = build_vidyard_download_key(vidyard_url)
 
         processed_any = True
         if entry_has_download(item):
@@ -1162,8 +1336,8 @@ def download_category_videos(config: CategoryConfig, *, limit_per_category: int 
             save_store(config, store)
             continue
 
-        if vidyard_url in known_downloads and Path(known_downloads[vidyard_url]).exists():
-            item["video_path"] = known_downloads[vidyard_url]
+        if vidyard_key in known_downloads and Path(known_downloads[vidyard_key]).exists():
+            item["video_path"] = known_downloads[vidyard_key]
             item["workflow_stage"] = WorkflowStage.DOWNLOADED.value
             item["last_error"] = None
             item["updated_at"] = utc_now_iso()
@@ -1176,7 +1350,7 @@ def download_category_videos(config: CategoryConfig, *, limit_per_category: int 
             item["workflow_stage"] = WorkflowStage.DOWNLOADED.value
             item["last_error"] = None
             item["updated_at"] = utc_now_iso()
-            known_downloads[vidyard_url] = item["video_path"]
+            known_downloads[vidyard_key] = item["video_path"]
         except Exception as exc:  # pragma: no cover - depende de red/yt_dlp
             append_error(item, "download", exc, url=vidyard_url)
         finally:
